@@ -3,92 +3,279 @@ name: Build RustDesk Personal macOS ARM64
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: "3.24.5"
+  MAC_RUST_VERSION: "1.81"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+
 jobs:
-  build:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-macos-arm64:
+    name: Build RustDesk-Personal ARM64
     runs-on: macos-14
+    needs: [generate-bridge]
 
     steps:
-      - name: Checkout
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable(
+              'ACTIONS_CACHE_URL',
+              process.env.ACTIONS_CACHE_URL || ''
+            );
+            core.exportVariable(
+              'ACTIONS_RUNTIME_TOKEN',
+              process.env.ACTIONS_RUNTIME_TOKEN || ''
+            );
+
+      - name: Checkout source
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Rename RustDesk config identity
+      # ------------------------------------------------------------
+      # 关键步骤：
+      # 把 RustDesk 内部 APP_NAME 改成 RustDesk-Personal
+      #
+      # 这样配置目录会和原 RustDesk 隔离：
+      # ~/Library/Preferences/com.carriez.RustDesk-Personal/
+      # ------------------------------------------------------------
+      - name: Change internal APP_NAME
         shell: bash
         run: |
-          sed -i '' 's/"RustDesk".to_owned()/"RustDesk-Personal".to_owned()/' \
-            libs/hbb_common/src/config.rs
+          CONFIG_FILE="libs/hbb_common/src/config.rs"
 
-      - name: Rename macOS app
+          echo "Before:"
+          grep -n 'APP_NAME' "$CONFIG_FILE" | head -10
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("libs/hbb_common/src/config.rs")
+          text = p.read_text()
+
+          old = 'RwLock::new("RustDesk".to_owned())'
+          new = 'RwLock::new("RustDesk-Personal".to_owned())'
+
+          if old not in text:
+              raise SystemExit(
+                  "ERROR: Could not find RustDesk APP_NAME in config.rs"
+              )
+
+          text = text.replace(old, new, 1)
+          p.write_text(text)
+
+          print("APP_NAME changed successfully.")
+          PY
+
+          echo "After:"
+          grep -n 'APP_NAME' "$CONFIG_FILE" | head -10
+
+          grep -q 'RustDesk-Personal' "$CONFIG_FILE"
+
+      - name: Install build dependencies
         shell: bash
         run: |
-          find flutter/macos -type f \
-            \( -name "*.plist" -o -name "*.pbxproj" \) \
-            -exec sed -i '' 's/RustDesk/RustDesk-Personal/g' {} \;
+          brew install llvm create-dmg
 
-      - name: Install dependencies
+          if command -v pkg-config >/dev/null 2>&1; then
+            echo "pkg-config already installed"
+          else
+            brew install pkg-config
+          fi
+
+      # RustDesk 官方当前明确要求 NASM 2.x，
+      # 不使用 Homebrew 当前可能安装的 NASM 3.x
+      - name: Install NASM 2.16.03
         shell: bash
         run: |
-          brew install nasm cmake ninja pkg-config create-dmg
+          wget -q \
+            https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
+          unzip -q nasm-2.16.03-macosx.zip
+
+          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
+          sudo chmod +x /usr/local/bin/nasm
+
+          nasm --version
 
       - name: Install Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
 
-      - name: Build
+      - name: Patch Flutter
+        shell: bash
+        run: |
+          FLUTTER_ROOT="$(dirname "$(dirname "$(which flutter)")")"
+
+          cd "$FLUTTER_ROOT"
+
+          if [ "${FLUTTER_VERSION}" = "3.24.5" ]; then
+            git apply \
+              "${GITHUB_WORKSPACE}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+          fi
+
+      - name: Flutter scheduler workaround
+        shell: bash
+        run: |
+          cd "$(dirname "$(which flutter)")"
+
+          sed -i -e \
+            's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' \
+            ../packages/flutter/lib/src/scheduler/binding.dart
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.MAC_RUST_VERSION }}
+          targets: aarch64-apple-darwin
+          components: rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rustdesk-personal-macos-arm64
+
+      - name: Restore Flutter bridge
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        env:
+          VCPKG_DEFAULT_TRIPLET: arm64-osx
+          VCPKG_DEFAULT_HOST_TRIPLET: arm64-osx
+        run: |
+          if ! "$VCPKG_ROOT/vcpkg" install \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+
+            find "$VCPKG_ROOT" -name "*.log" | while read -r logfile; do
+              echo "======================================"
+              echo "$logfile"
+              echo "======================================"
+              tail -200 "$logfile" || true
+            done
+
+            exit 1
+          fi
+
+      - name: Patch macOS minimum version
         shell: bash
         run: |
           MIN_MACOS_VERSION="12.3"
 
-          sed -i '' \
-            "s/MACOSX_DEPLOYMENT_TARGET=[0-9]*\.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" \
-            build.py || true
+          sed -i -e \
+            "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" \
+            build.py
 
-          sed -i '' \
+          sed -i -e \
             "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" \
-            flutter/macos/Podfile || true
+            flutter/macos/Podfile
 
-          ./build.py --flutter --hwcodec --unix-file-copy-paste
+          sed -i -e \
+            "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"${MIN_MACOS_VERSION}\"/" \
+            Cargo.toml
 
-      - name: Rename final app
+          sed -i -e \
+            "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN_MACOS_VERSION};/" \
+            flutter/macos/Runner.xcodeproj/project.pbxproj
+
+      - name: Build RustDesk
         shell: bash
         run: |
-          cd flutter/build/macos/Build/Products/Release
+          ./build.py \
+            --flutter \
+            --hwcodec \
+            --unix-file-copy-paste \
+            --screencapturekit
 
-          if [ -d "RustDesk.app" ]; then
-            mv RustDesk.app RustDesk-Personal.app
-          fi
+      # ------------------------------------------------------------
+      # 编译完成后再修改 macOS App 外部身份
+      # ------------------------------------------------------------
+      - name: Rename app to RustDesk-Personal
+        shell: bash
+        run: |
+          RELEASE_DIR="flutter/build/macos/Build/Products/Release"
+
+          cd "$RELEASE_DIR"
+
+          test -d RustDesk.app
+
+          mv RustDesk.app RustDesk-Personal.app
+
+          PLIST="RustDesk-Personal.app/Contents/Info.plist"
 
           /usr/libexec/PlistBuddy \
             -c "Set :CFBundleName RustDesk-Personal" \
-            RustDesk-Personal.app/Contents/Info.plist || true
+            "$PLIST" || true
 
           /usr/libexec/PlistBuddy \
             -c "Set :CFBundleDisplayName RustDesk-Personal" \
-            RustDesk-Personal.app/Contents/Info.plist || true
+            "$PLIST" || true
 
           /usr/libexec/PlistBuddy \
             -c "Set :CFBundleIdentifier com.carriez.rustdesk-personal" \
-            RustDesk-Personal.app/Contents/Info.plist || true
+            "$PLIST"
 
-          codesign --force --deep --sign - RustDesk-Personal.app
+          echo "Bundle ID:"
+          /usr/libexec/PlistBuddy \
+            -c "Print :CFBundleIdentifier" \
+            "$PLIST"
 
-      - name: Package
+      # 修改 App 后，原签名失效。
+      # 个人使用直接做 ad-hoc 签名。
+      - name: Ad-hoc codesign
+        shell: bash
+        run: |
+          APP="flutter/build/macos/Build/Products/Release/RustDesk-Personal.app"
+
+          codesign \
+            --force \
+            --deep \
+            --sign - \
+            "$APP"
+
+          codesign \
+            --verify \
+            --deep \
+            --strict \
+            "$APP"
+
+      - name: Package ZIP
         shell: bash
         run: |
           cd flutter/build/macos/Build/Products/Release
-          ditto -c -k --sequesterRsrc --keepParent \
+
+          ditto \
+            -c \
+            -k \
+            --sequesterRsrc \
+            --keepParent \
             RustDesk-Personal.app \
             RustDesk-Personal-macos-arm64.zip
 
-      - name: Upload artifact
+      - name: Upload RustDesk-Personal
         uses: actions/upload-artifact@v4
         with:
           name: RustDesk-Personal-macos-arm64
-          path: flutter/build/macos/Build/Products/Release/RustDesk-Personal-macos-arm64.zip
+          path: >
+            flutter/build/macos/Build/Products/Release/
+            RustDesk-Personal-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 14
