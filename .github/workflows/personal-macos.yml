@@ -1,0 +1,94 @@
+name: Build RustDesk Personal macOS ARM64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Rename RustDesk config identity
+        shell: bash
+        run: |
+          sed -i '' 's/"RustDesk".to_owned()/"RustDesk-Personal".to_owned()/' \
+            libs/hbb_common/src/config.rs
+
+      - name: Rename macOS app
+        shell: bash
+        run: |
+          find flutter/macos -type f \
+            \( -name "*.plist" -o -name "*.pbxproj" \) \
+            -exec sed -i '' 's/RustDesk/RustDesk-Personal/g' {} \;
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          brew install nasm cmake ninja pkg-config create-dmg
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Build
+        shell: bash
+        run: |
+          MIN_MACOS_VERSION="12.3"
+
+          sed -i '' \
+            "s/MACOSX_DEPLOYMENT_TARGET=[0-9]*\.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" \
+            build.py || true
+
+          sed -i '' \
+            "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" \
+            flutter/macos/Podfile || true
+
+          ./build.py --flutter --hwcodec --unix-file-copy-paste
+
+      - name: Rename final app
+        shell: bash
+        run: |
+          cd flutter/build/macos/Build/Products/Release
+
+          if [ -d "RustDesk.app" ]; then
+            mv RustDesk.app RustDesk-Personal.app
+          fi
+
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleName RustDesk-Personal" \
+            RustDesk-Personal.app/Contents/Info.plist || true
+
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleDisplayName RustDesk-Personal" \
+            RustDesk-Personal.app/Contents/Info.plist || true
+
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleIdentifier com.carriez.rustdesk-personal" \
+            RustDesk-Personal.app/Contents/Info.plist || true
+
+          codesign --force --deep --sign - RustDesk-Personal.app
+
+      - name: Package
+        shell: bash
+        run: |
+          cd flutter/build/macos/Build/Products/Release
+          ditto -c -k --sequesterRsrc --keepParent \
+            RustDesk-Personal.app \
+            RustDesk-Personal-macos-arm64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RustDesk-Personal-macos-arm64
+          path: flutter/build/macos/Build/Products/Release/RustDesk-Personal-macos-arm64.zip
